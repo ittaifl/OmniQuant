@@ -3,7 +3,7 @@ import torch.nn as nn
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
 from models.int_falcon_layer import QuantFalconDecoderLayer
-from quantize.int_linear import QuantLinear
+from quantize.int_linear import QuantLinear, prune_wrapper
 from contextlib import nullcontext
 import copy
 import math
@@ -11,20 +11,33 @@ import utils
 import os
 import pdb
 import gc
+from parallel_utils import nvidia_smi_memory_info
 from quantize.utils import let_parameters, lwc_parameters, get_omni_parameters,\
                             omni_state_dict, register_scales_and_zeros,smooth_and_quant_temporary,\
-                            smooth_and_quant_inplace,clear_temp_variable,set_quant_state
+                            smooth_and_quant_inplace,clear_temp_variable,set_quant_state,\
+                            prune_parameters, register_prune_masks, clamp_prune_masks, check_val_is_not_inf_nan, enable_debug, \
+                            grad_magnitude, log_grads, variational_parameters, eval_variational_reg
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda
     import auto_gptq.nn_modules.qlinear.qlinear_triton as qlinear_triton
 except:
     print("auto_gptq is required for real quantization")
 
-
+def get_memory_usage(logger):
+    memory_info = nvidia_smi_memory_info()[0]
+    t = memory_info['total_memory']
+    a = memory_info['used_memory']
+    f = memory_info['free_memory']
+    logger.info(f"=== Memory usage ===")
+    logger.info(f"Total memory: {t} MB")
+    logger.info(f"Allocated memory: {a} MB")
+    logger.info(f"Free memory: {f} MB")
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, QuantLinear)}
 
+def get_magnitudes():
+    return prune_wrapper.get_magnitudes()
 
 def add_new_module(name, original_module, added_module):
     levels = name.split('.')
@@ -55,6 +68,7 @@ def omniquant(
     use_cache = model.config.use_cache
     model.config.use_cache = False
     is_llama = False
+
     if "llama" in args.net.lower():
         is_llama = True
         layers = model.model.layers
@@ -186,12 +200,20 @@ def omniquant(
         omni_parameters = torch.load(args.resume)
     else:
         omni_parameters = {}
-
-    
     
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
+
+        # Pruning
+
+        if args.prune:
+            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+            if args.prune_method == 'pman':
+                prune_wrapper.init_new_pman_state()
+
+        # End pruning
+
         if "mixtral" in args.net.lower():  
             # for mixtral, we only leverage lwc, which can be achieve by simply replace Linear with QuantLinear
             qlayer = copy.deepcopy(layer)
@@ -203,7 +225,6 @@ def omniquant(
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
 
-        
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
         if args.epochs > 0:
@@ -214,6 +235,16 @@ def omniquant(
                         if args.aug_loss:
                             fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
         # init smooth parameters
+
+        # Pruning
+
+        if args.prune:
+            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=args.prune, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+            if args.prune_method == 'pman':
+                prune_wrapper.init_new_pman_state()
+
+        # End pruning
+
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
         use_shift = True 
@@ -244,13 +275,36 @@ def omniquant(
             with torch.no_grad():
                 qlayer.float()      # required for AMP training
             # create optimizer
-            optimizer = torch.optim.AdamW(
-                [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
+            params = [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr},
+                        {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}]
+            if args.prune and args.prune_method == 'variational':
+                params.append({'params':variational_parameters(qlayer), 'lr':args.var_lr})
+            optimizer = torch.optim.AdamW(params,weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
+
+            # Pruning:
+
+            if args.prune:
+                prune_optimizer = None
+                if args.prune_method == 'pman':
+                    prune_optimizer = torch.optim.SGD([{"params":prune_parameters(qlayer),"lr":args.lwc_lr}])
+                    prune_wrapper.init_new_pman_state()
+
+            # End pruning
             
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
+                # Pruning:
+
+                if args.prune:
+                    if args.prune_method == 'pman':
+                        prune_optimizer.zero_grad()
+                        prune_wrapper.get_prune_pman_state().next_epoch()
+
+                pman_batch_size = args.gumbel_batch_size
+
+                # End pruning
                 for j in range(args.nsamples//args.batch_size):    
                     index = j * args.batch_size
                     # obtain output of quantization model
@@ -260,6 +314,52 @@ def omniquant(
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+
+                        if args.prune and args.prune_method == 'variational':
+                            loss += eval_variational_reg(qlayer)
+
+                        # Pruning:
+
+                        prune_loss = 0
+                        if args.prune:
+                            if args.prune_method == 'pman':
+                                prune_wrapper.get_prune_pman_state().set_prune_state(train_prune=True)
+
+                                for s in range(args.ngumbel_samples):
+                                    # Disabling pruning
+                                    prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+                                    no_prune_quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                                    # Enabling pruning
+                                    prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=args.prune, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+                                    prune_quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                                    prune_loss += loss_func(no_prune_quant_out, prune_quant_out) / args.ngumbel_samples
+                                    prune_wrapper.get_prune_pman_state().next_sample()
+
+                                    if (s + 1) % pman_batch_size == 0:
+                                        prune_loss.backward(retain_graph=True)
+                                        logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                        prune_optimizer.step()
+                                        prune_optimizer.zero_grad()
+                                        prune_loss = prune_loss.detach()
+                                        prune_loss = 0
+                                        #check_val_is_not_inf_nan(qlayer, logger, i, j, s)
+                                        clamp_prune_masks(qlayer)
+
+                                prune_wrapper.get_prune_pman_state().set_prune_state(train_prune=False)
+                                prune_wrapper.get_prune_pman_state().next_batch()
+
+                                should_step = args.ngumbel_samples % pman_batch_size != 0
+
+                                
+                                if should_step:
+                                    prune_loss.backward(retain_graph=True)
+                                    logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                    prune_optimizer.step()
+                                    prune_optimizer.zero_grad()
+                                    clamp_prune_masks(qlayer)
+
+                        # End pruning
+
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
@@ -274,6 +374,14 @@ def omniquant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
+
+            # Pruning
+
+            if args.prune:
+                del prune_optimizer
+
+            # End Pruning
+
         qlayer.half() 
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
@@ -285,11 +393,29 @@ def omniquant(
                     for j in range(args.nsamples):
                         quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
             register_scales_and_zeros(qlayer)
+            # Pruning:
+
+            if args.prune:
+                enable_debug(qlayer, i, logger)
+            #    if args.prune_method is 'pman':
+            #        register_prune_masks(qlayer)
+
+            # End pruning
             layers[i] = qlayer.to("cpu")
-            omni_parameters[i] = omni_state_dict(qlayer)
+            omni_parameters[i] = omni_state_dict(qlayer, use_prune=args.prune)
             torch.save(omni_parameters, os.path.join(args.output_dir, f"omni_parameters.pth"))
         else:
             register_scales_and_zeros(qlayer)
+
+            if args.prune:
+                enable_debug(qlayer, i, logger)
+            # Pruning:
+
+            #if args.prune:
+            #    if args.prune_method is 'pman':
+            #        register_prune_masks(qlayer)
+
+            # End pruning
             layers[i] = qlayer.to("cpu")
         if args.real_quant:
             assert args.wbits in [2,3,4] and args.abits >= 16   # only support weight-only quantization
@@ -312,6 +438,8 @@ def omniquant(
         del layer
         torch.cuda.empty_cache()
 
+    if args.prune_method == 'pman':
+        log_grads(args.output_dir, logger)
     del inps
     del quant_inps
     del fp_inps
