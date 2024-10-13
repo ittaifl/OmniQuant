@@ -211,6 +211,8 @@ def omniquant(
             prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
             if args.prune_method == 'pman':
                 prune_wrapper.init_new_pman_state()
+            else:
+                prune_wrapper.set_variational_train_clip(args.var_train_clip)
 
         # End pruning
 
@@ -310,20 +312,26 @@ def omniquant(
                     # obtain output of quantization model
                     with traincast():
                         smooth_and_quant_temporary(qlayer, args, is_llama)
+
+                        if args.prune and args.prune_method == 'variational':
+                            prune_wrapper.set_train_prune(train_prune=True)    
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
 
                         if args.prune and args.prune_method == 'variational':
-                            loss += eval_variational_reg(qlayer)
+                            loss += 0.1 * eval_variational_reg(qlayer)
+
+                        if args.prune and args.prune_method == 'variational':
+                            prune_wrapper.set_train_prune(train_prune=False)
 
                         # Pruning:
 
                         prune_loss = 0
                         if args.prune:
                             if args.prune_method == 'pman':
-                                prune_wrapper.get_prune_pman_state().set_prune_state(train_prune=True)
+                                prune_wrapper.set_train_prune(train_prune=True)
 
                                 for s in range(args.ngumbel_samples):
                                     # Disabling pruning
@@ -345,7 +353,7 @@ def omniquant(
                                         #check_val_is_not_inf_nan(qlayer, logger, i, j, s)
                                         clamp_prune_masks(qlayer)
 
-                                prune_wrapper.get_prune_pman_state().set_prune_state(train_prune=False)
+                                prune_wrapper.set_train_prune(train_prune=False)
                                 prune_wrapper.get_prune_pman_state().next_batch()
 
                                 should_step = args.ngumbel_samples % pman_batch_size != 0

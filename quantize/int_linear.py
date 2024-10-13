@@ -72,36 +72,45 @@ class QuantLinear(nn.Module):
         if self.use_act_quant and not self.disable_input_quant:
             input = self.act_quantizer(input)
 
-        if prune_wrapper.get_prune_active() and prune_wrapper.get_prune_method() == 'pman':
-            if self.prune_mask is None:
-                self.prune_mask = nn.Parameter(torch.clamp(torch.zeros(size=self.weight.shape, dtype=self.weight.dtype, device=prune_wrapper.get_device()).uniform_(), min=0, max=PRUNE_UPPER_LIMIT))
-            if self.print_debug:
-                self.logger.info(self.debug_str)
-                number_of_weights = torch.sum(self.prune_mask.to(dtype=torch.float32)).item()
-                self.logger.info(f'Shape: {self.prune_mask.shape}')
-                self.logger.info(f'Average number of weights not zero is: {number_of_weights}')
-                self.logger.info(f"Percentage of weights on average not zero is: {(number_of_weights / torch.numel(self.prune_mask)) * 100}")
-                magnitudes = prune_wrapper.get_magnitudes()
-                if self.layer_num not in magnitudes.keys():
-                    magnitudes[self.layer_num] = {}
-                magnitudes[self.layer_num][self.debug_str] = self.prune_mask.view(-1).cpu()
-                self.print_debug = False
-            weight = weight * self.calculate_mask()
-        
-        out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
-
         if prune_wrapper.get_prune_active() and prune_wrapper.get_prune_method() == 'variational':
             if self.log_sigma2 is None:
                     self.log_sigma2 = nn.Parameter(torch.randn_like(self.weight, dtype=self.weight.dtype, device=prune_wrapper.get_device()))
 
-            out = self.calculate_variational(weight, input, out)
+            log_alpha = torch.clamp((self.log_sigma2 - torch.log(weight * weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
+            clip_mask = torch.ge(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
+
+            if not prune_wrapper.get_train_prune():
+                weight = weight * clip_mask
+
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+
+            out = self.calculate_variational(weight, input, out, log_alpha, clip_mask)
+
+        else:
+            if prune_wrapper.get_prune_active() and prune_wrapper.get_prune_method() == 'pman':
+                if self.prune_mask is None:
+                    self.prune_mask = nn.Parameter(torch.clamp(torch.zeros(size=self.weight.shape, dtype=self.weight.dtype, device=prune_wrapper.get_device()).uniform_(), min=0, max=PRUNE_UPPER_LIMIT))
+                if self.print_debug:
+                    self.logger.info(self.debug_str)
+                    number_of_weights = torch.sum(self.prune_mask.to(dtype=torch.float32)).item()
+                    self.logger.info(f'Shape: {self.prune_mask.shape}')
+                    self.logger.info(f'Average number of weights not zero is: {number_of_weights}')
+                    self.logger.info(f"Percentage of weights on average not zero is: {(number_of_weights / torch.numel(self.prune_mask)) * 100}")
+                    magnitudes = prune_wrapper.get_magnitudes()
+                    if self.layer_num not in magnitudes.keys():
+                        magnitudes[self.layer_num] = {}
+                    magnitudes[self.layer_num][self.debug_str] = self.prune_mask.view(-1).cpu()
+                    self.print_debug = False
+                weight = weight * self.calculate_mask()
+
+            out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
 
         return out
     
     def calculate_mask(self):
         mask = None
         if prune_wrapper.get_prune_method() == 'pman':
-            if prune_wrapper.get_prune_pman_state().is_train():
+            if prune_wrapper.get_train_prune():
                 tmp_1 = torch.ones(self.prune_mask.shape, dtype=self.prune_mask.dtype, device=prune_wrapper.get_device()) - self.prune_mask
                 tmp_2 = torch.log(self.prune_mask / tmp_1)
                 mask = torch.sigmoid((tmp_2 + prune_wrapper.get_prune_pman_state().get_gumbel_sample()) / prune_wrapper.get_prune_pman_state().get_temprature())
@@ -111,18 +120,29 @@ class QuantLinear(nn.Module):
 
         return mask
 
-    def calculate_variational(self, weight, input, out):
+    def calculate_variational(self, weight, input, out, log_alpha, clip_mask):
         res = out
-        if prune_wrapper.get_prune_method() == 'variational':
-            log_alpha = torch.clamp((self.log_sigma2 - torch.log(weight * weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
-            clip_mask = torch.ge(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
 
-            if prune_wrapper.get_variational_train_clip():
-                weight = weight * clip_mask
+        if prune_wrapper.get_variational_train_clip():
+            weight = weight * clip_mask
 
-            mu = out
-            si = torch.sqrt(torch.matmul((input * input), torch.exp(log_alpha) * weight * weight) + 1e-8)
-            res = mu + (torch.randn_like(weight) * si)
+        mu = out
+        tmp1 = input * input
+        tmp2 = torch.exp(log_alpha) * weight * weight
+
+        """print(f'input shape: {input.shape}')
+        print(f'weight shape: {weight.shape}')
+        print(f'out shape: {out.shape}')
+        print(f'mu shape: {mu.shape}')
+        print(f'tmp1 shape: {tmp1.shape}')
+        print(f'tmp2 shape: {tmp2.shape}')
+        print(f'log_sigma2 shape: {self.log_sigma2.shape}')"""
+
+        tmp3 = torch.matmul(tmp1, tmp2.T)
+        tmp4 = tmp3 + 1e-8
+        si = torch.sqrt(tmp4)
+
+        res = mu + (torch.randn_like(mu) * si)
 
         return res
     
@@ -133,7 +153,7 @@ class QuantLinear(nn.Module):
         C = -k1
         log_alpha = torch.clamp((self.log_sigma2 - torch.log(self.weight * self.weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
         mdkl = k1 * torch.sigmoid(k2 + k3 * log_alpha) - 0.5 * torch.log1p(torch.exp(-log_alpha)) + C
-        return torch.sum(mdkl)
+        return -torch.sum(mdkl)
 
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
@@ -158,7 +178,6 @@ class PmanState():
         if n_epochs == 0:
             n_epochs = 1
         self.temprature_decline = 0.97 / n_epochs
-        self.train_prune = False
         self.gumbel_samples = torch.zeros(prune_wrapper.get_n_gumbel_samples())
         self.gumbel_index = 0
         self.gumbel_samples = self.gumbel_samples.to(device=dev)
@@ -172,14 +191,8 @@ class PmanState():
     def get_gumbel_sample(self):
         return self.gumbel_samples[self.gumbel_index]
     
-    def is_train(self):
-        return self.train_prune
-    
     def get_temprature(self):
         return self.temprature
-        
-    def set_prune_state(self, train_prune=False):
-        self.train_prune = train_prune
     
     def next_epoch(self):
         self.temprature -= self.temprature_decline
@@ -202,6 +215,7 @@ class PruneStateWrapper():
         self.prune_method = prune_method
         self.magnitudes = {}
         self.variational_train_clip = variational_train_clip
+        self.train_prune = False
 
     def init_new_pman_state(self):
         self.pman_state_obj = PmanState(self.n_epochs, self.dev)
@@ -240,6 +254,12 @@ class PruneStateWrapper():
 
     def get_variational_train_clip(self):
         return self.variational_train_clip
+    
+    def set_train_prune(self, train_prune=False):
+        self.train_prune = train_prune
+
+    def get_train_prune(self):
+        return self.train_prune
 
 
 prune_wrapper = PruneStateWrapper()
