@@ -10,7 +10,7 @@ from lm_eval import evaluator
 from pprint import pprint
 from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
 import torch.nn as nn
-from quantize.omniquant import omniquant
+from quantize.omniquant import omniquant, get_magnitudes
 from tqdm import tqdm
 import utils
 from pathlib import Path
@@ -79,6 +79,42 @@ def log_magnitudes(args, logger):
 
         plt.clf()
 
+def log_sparsity(args, results):
+    import matplotlib.pyplot as plt
+    import os
+
+    datasets = ["wikitext2", "c4"]
+    values = []
+
+    for layer_num, l in get_magnitudes().items():
+        values.append(float('%.2f' % float(sum(l) / len(l))))
+    
+    
+    plt.style.use('_mpl-gallery')
+
+    # make data
+
+    # plot
+    plt.figure(figsize=(9,5))
+
+    plt.scatter(np.arange(len(values)), values)
+
+    # Adjusting layout for better spacing
+    plt.subplots_adjust(left=0.2, right=0.8, bottom=0.3, top=0.85)
+    
+    plt.title(f'Sparsity rates by layer, model = {args.net}, lr={args.var_lr}, epochs={args.epochs}')
+    plt.xlabel('Layer number')
+    plt.ylabel('Sparsity rate')
+
+    # Add text below the plot, centered
+    plt.figtext(0.5, 0.02, f"wikitext2 score = {results['wikitext2']}, c4 score = {results['c4']}", ha="center", fontsize=12)
+
+    # Adjust layout to accommodate the text
+    #plt.subplots_adjust(bottom=0.2)
+
+    plt.savefig(os.path.join(args.output_dir, f"sparsity_by_layer_model_{args.net}_lr_{args.var_lr}_epochs_{args.epochs}.png"))
+
+    plt.clf()
 
 @torch.no_grad()
 def evaluate(lm, args, logger):
@@ -410,9 +446,11 @@ def main():
                     del module.fc1_smooth_shift           
         lm.model.save_pretrained(args.save_dir)  
         lm.tokenizer.save_pretrained(args.save_dir) 
-    evaluate(lm, args,logger)
+    results = evaluate(lm, args,logger)
     if args.prune_method == 'pman':
         log_magnitudes(args, logger)
+    if args.prune and args.prune_method == 'variational':
+        log_sparsity(args, results)
 
 
 if __name__ == "__main__":

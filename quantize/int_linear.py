@@ -47,12 +47,13 @@ class QuantLinear(nn.Module):
 
         self.prune_mask = None
         self.log_sigma2 = None
+        #self.prev_param = None
         if prune_wrapper.get_prune_active():
             if prune_wrapper.get_prune_method() == 'pman':
                 self.prune_mask = nn.Parameter(torch.clamp(torch.zeros(size=self.weight.shape, dtype=self.weight.dtype, device=prune_wrapper.get_device()).uniform_(), min=0, max=PRUNE_UPPER_LIMIT))
 
             if prune_wrapper.get_prune_method() == 'variational':
-                self.log_sigma2 = nn.Parameter(torch.randn_like(self.weight, dtype=self.weight.dtype, device=prune_wrapper.get_device()))
+                self.log_sigma2 = nn.Parameter(torch.zeros_like(self.weight, dtype=self.weight.dtype, device=prune_wrapper.get_device()) - 10)
         self.print_debug = False
 
         # End Pruning:
@@ -74,32 +75,35 @@ class QuantLinear(nn.Module):
 
         if prune_wrapper.get_prune_active() and prune_wrapper.get_prune_method() == 'variational':
             if self.log_sigma2 is None:
-                    self.log_sigma2 = nn.Parameter(torch.randn_like(self.weight, dtype=self.weight.dtype, device=prune_wrapper.get_device()))
+                    self.log_sigma2 = nn.Parameter(torch.zeros_like(self.weight, dtype=self.weight.dtype, device=prune_wrapper.get_device()) - 10)
+            """
+            if self.prev_param is None:
+                self.prev_param = self.log_sigma2
 
+            else:
+                print(f'prev and param are different in {torch.sum((self.prev_param != self.log_sigma2).to(dtype=torch.int))} cells')
+                self.prev_param = self.log_sigma2
+            """
             log_alpha = torch.clamp((self.log_sigma2 - torch.log(weight * weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
-            clip_mask = torch.ge(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
+            clip_mask = torch.lt(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
 
             if not prune_wrapper.get_train_prune():
                 weight = weight * clip_mask
 
+            if self.print_debug:
+                self.print_info(prune_wrapper.get_prune_method())
+                self.print_debug = False
+
             out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
 
-            out = self.calculate_variational(weight, input, out, log_alpha, clip_mask)
+            #out = self.calculate_variational(weight, input, out, log_alpha, clip_mask)
 
         else:
             if prune_wrapper.get_prune_active() and prune_wrapper.get_prune_method() == 'pman':
                 if self.prune_mask is None:
                     self.prune_mask = nn.Parameter(torch.clamp(torch.zeros(size=self.weight.shape, dtype=self.weight.dtype, device=prune_wrapper.get_device()).uniform_(), min=0, max=PRUNE_UPPER_LIMIT))
                 if self.print_debug:
-                    self.logger.info(self.debug_str)
-                    number_of_weights = torch.sum(self.prune_mask.to(dtype=torch.float32)).item()
-                    self.logger.info(f'Shape: {self.prune_mask.shape}')
-                    self.logger.info(f'Average number of weights not zero is: {number_of_weights}')
-                    self.logger.info(f"Percentage of weights on average not zero is: {(number_of_weights / torch.numel(self.prune_mask)) * 100}")
-                    magnitudes = prune_wrapper.get_magnitudes()
-                    if self.layer_num not in magnitudes.keys():
-                        magnitudes[self.layer_num] = {}
-                    magnitudes[self.layer_num][self.debug_str] = self.prune_mask.view(-1).cpu()
+                    self.print_info(prune_wrapper.get_prune_method())
                     self.print_debug = False
                 weight = weight * self.calculate_mask()
 
@@ -152,13 +156,47 @@ class QuantLinear(nn.Module):
         k3 = 1.48695
         C = -k1
         log_alpha = torch.clamp((self.log_sigma2 - torch.log(self.weight * self.weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
-        mdkl = k1 * torch.sigmoid(k2 + k3 * log_alpha) - 0.5 * torch.log1p(torch.exp(-log_alpha)) + C
-        return -torch.sum(mdkl)
+        mdkl = self.eval_reg(log_alpha)
+        #mdkl = k1 * torch.sigmoid(k2 + k3 * log_alpha) - 0.5 * torch.log1p(torch.exp(-log_alpha)) + C
+        #print(f'self = {self}, mdkl = {torch.sum(mdkl)}')
+        return torch.sum(mdkl)
+    
+    def eval_reg(self, log_alpha):
+        return (0.5 * torch.log1p(torch.exp(-log_alpha)) - (0.03 + 1.0 / (1.0 + torch.exp(-(1.5 * (log_alpha + 1.3)))) * 0.64))
 
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
         self.use_weight_quant = weight_quant
         self.use_act_quant = act_quant
+
+    def get_sparsity(self, i):
+        number_of_weights = 0
+        if prune_wrapper.get_prune_method() == 'variational':
+            log_alpha = torch.clamp((self.log_sigma2 - torch.log(self.weight * self.weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
+            clip_mask = torch.lt(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
+            number_of_weights = torch.sum(clip_mask).item()
+            sparsity = (1 - number_of_weights / torch.numel(self.weight)) * 100
+            magnitudes = prune_wrapper.get_magnitudes()
+            if i not in magnitudes.keys():
+                magnitudes[i] = []
+            magnitudes[i].append(sparsity)
+
+    def print_info(self, method):
+        number_of_weights = 0
+        if method == 'pman':
+            number_of_weights = torch.sum(self.prune_mask.to(dtype=torch.float32)).item()
+            magnitudes = prune_wrapper.get_magnitudes()
+            if self.layer_num not in magnitudes.keys():
+                magnitudes[self.layer_num] = {}
+            magnitudes[self.layer_num][self.debug_str] = self.prune_mask.view(-1).cpu()
+        if method == 'variational':
+            log_alpha = torch.clamp((self.log_sigma2 - torch.log(self.weight * self.weight)), min=VARIATIONAL_LOWER_LIMIT, max=VARIATIONAL_UPPER_LIMIT)
+            clip_mask = torch.lt(log_alpha, VARIATIONAL_THRESHOLD).to(dtype=torch.int)
+            number_of_weights = torch.sum(clip_mask).item()
+        self.logger.info(self.debug_str)
+        self.logger.info(f'Shape: {self.weight.shape}')
+        self.logger.info(f'Average number of weights not zero is: {number_of_weights}')
+        self.logger.info(f"Percentage of weights on average not zero is: {(number_of_weights / torch.numel(self.weight)) * 100}")
 
 # Pruning:
 

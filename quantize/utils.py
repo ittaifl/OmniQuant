@@ -31,7 +31,7 @@ def prune_parameters(model):
 def variational_parameters(model):
     params = []
     for n, m in model.named_parameters():
-        if n.find('log_sigma2') > -1:
+        if n.find('sigma') > -1:
             params.append(m)
     return iter(params)
 
@@ -68,10 +68,16 @@ def check_val_is_not_inf_nan(model, logger, i, j, s):
                                 logger.info(f"inf value at prune mask in layer {i}, module {name}, batch {j}, sample {s}")
                                 logger.info(f"param name is {p_name}, at index ({k}, {r})")
 
-def enable_debug(model, i, logger):
+def enable_debug(model, i, logger, epoch=0, n_epoch=1):
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
-            module.enable_debug(f'layer_{i},_{name}', i, logger)
+            """str = f'epoch_{epoch}'
+            if epoch == n_epoch:
+                str = f'inference'
+            module.enable_debug(f'layer_{i}_{name}_{str}', i, logger)
+            """
+            module.get_sparsity(i)
+
 
 grads = {}
 grad_by_sample = {}
@@ -82,7 +88,7 @@ def grad_magnitude(model, i):
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
             for p_name, param in module.named_parameters():
-                if p_name.find('prune') > -1 and param.grad is not None:
+                if p_name.find('prune') > -1 or p_name.find('sigma') > -1 and param.grad is not None:
                     if i not in grads.keys():
                         grads[i] = {}
                     if name not in grads[i].keys():
@@ -96,7 +102,11 @@ def grad_magnitude(model, i):
                     if name not in grad_by_sample[i].keys():
                         grad_by_sample[i][name] = []
                     grad_by_sample[i][name].append(sparsity_rate)
-                    tmp_max = torch.max(param.grad)
+                    #print(p_name)
+                    tmp_max = torch.max(torch.abs(param.grad))
+                    #print(tmp_max)
+                    #print(f'\nname = {p_name}:\n')
+                    #print(param.grad)
                     if max is None:
                         max = tmp_max
                     else:
@@ -171,13 +181,16 @@ def log_grads(output_dir, logger):
         plt.clf()
 # End pruning
 
-def get_omni_parameters(model, use_shift=True):
+def get_omni_parameters(model, use_shift=True, use_prune=False):
     params = []
+    params_names = []
     template = "smooth" if use_shift else "smooth_scale"
+    template2 = 'sigma' if use_prune else "!"
     for n, m in model.named_parameters():
-        if n.find('bound_factor') > -1 or n.find(template) > -1:
+        if n.find('bound_factor') > -1 or n.find(template) > -1 or n.find(template2):
             params.append(m)
-    return iter(params)  
+            params_names.append(n)
+    return iter(params), iter(params_names)  
 
 def omni_state_dict(model, destination=None, prefix='', keep_vars=False, use_prune=False):
     if destination is None:

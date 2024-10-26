@@ -208,7 +208,7 @@ def omniquant(
         # Pruning
 
         if args.prune:
-            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=args.prune, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
             if args.prune_method == 'pman':
                 prune_wrapper.init_new_pman_state()
             else:
@@ -226,6 +226,17 @@ def omniquant(
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
+
+        # Pruning
+
+        if args.prune:
+            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+            if args.prune_method == 'pman':
+                prune_wrapper.init_new_pman_state()
+            else:
+                prune_wrapper.set_variational_train_clip(args.var_train_clip)
+
+        # End pruning
 
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
@@ -291,6 +302,8 @@ def omniquant(
                 if args.prune_method == 'pman':
                     prune_optimizer = torch.optim.SGD([{"params":prune_parameters(qlayer),"lr":args.lwc_lr}])
                     prune_wrapper.init_new_pman_state()
+                #if args.prune_method == 'variational':
+                #    prune_optimizer = torch.optim.AdamW([{'params':variational_parameters(qlayer), 'lr':args.var_lr}])
 
             # End pruning
             
@@ -303,6 +316,7 @@ def omniquant(
                     if args.prune_method == 'pman':
                         prune_optimizer.zero_grad()
                         prune_wrapper.get_prune_pman_state().next_epoch()
+                    #enable_debug(qlayer, i, logger, epochs, args.epochs)
 
                 pman_batch_size = args.gumbel_batch_size
 
@@ -313,18 +327,15 @@ def omniquant(
                     with traincast():
                         smooth_and_quant_temporary(qlayer, args, is_llama)
 
-                        if args.prune and args.prune_method == 'variational':
-                            prune_wrapper.set_train_prune(train_prune=True)    
+                        #if args.prune and args.prune_method == 'variational':
+                            #prune_wrapper.set_train_prune(train_prune=True)    
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                        reg_loss = 0
+                        if args.prune and args.prune_method == 'variational':
+                            reg_loss =  eval_variational_reg(qlayer)
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-
-                        if args.prune and args.prune_method == 'variational':
-                            loss += 0.1 * eval_variational_reg(qlayer)
-
-                        if args.prune and args.prune_method == 'variational':
-                            prune_wrapper.set_train_prune(train_prune=False)
 
                         # Pruning:
 
@@ -365,7 +376,16 @@ def omniquant(
                                     prune_optimizer.step()
                                     prune_optimizer.zero_grad()
                                     clamp_prune_masks(qlayer)
-
+                            """
+                            if args.prune_method == 'variational':
+                                prune_loss = eval_variational_reg(qlayer)
+                                prune_loss.backward()
+                                #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                prune_optimizer.step()
+                                #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                prune_optimizer.zero_grad()
+                                #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                            """
                         # End pruning
 
                     if not math.isfinite(loss.item()):
@@ -373,8 +393,10 @@ def omniquant(
                         pdb.set_trace()
                         
                     loss_list.append(loss.detach().cpu())
+                    loss += reg_loss
                     optimizer.zero_grad()
-                    norm = loss_scaler(loss, optimizer,parameters= get_omni_parameters(qlayer, use_shift)).cpu()
+                    param, param_to_name = get_omni_parameters(qlayer, use_shift, args.prune_method == 'variational')
+                    norm = loss_scaler(loss, optimizer,parameters=param).cpu()
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
@@ -403,8 +425,8 @@ def omniquant(
             register_scales_and_zeros(qlayer)
             # Pruning:
 
-            if args.prune:
-                enable_debug(qlayer, i, logger)
+            if args.prune and args.prune_method == 'variational':
+                enable_debug(qlayer, i, logger, args.epochs, args.epochs)
             #    if args.prune_method is 'pman':
             #        register_prune_masks(qlayer)
 
@@ -415,11 +437,10 @@ def omniquant(
         else:
             register_scales_and_zeros(qlayer)
 
-            if args.prune:
-                enable_debug(qlayer, i, logger)
             # Pruning:
 
-            #if args.prune:
+            if args.prune and args.prune_method == 'variational':
+                enable_debug(qlayer, i, logger, args.epochs, args.epochs)
             #    if args.prune_method is 'pman':
             #        register_prune_masks(qlayer)
 
