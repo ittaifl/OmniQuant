@@ -86,8 +86,14 @@ def log_sparsity(args, results):
     datasets = ["wikitext2", "c4"]
     values = []
 
+    sums = 0
+    counter = 0
+
     for layer_num, l in get_magnitudes().items():
-        values.append(float('%.2f' % float(sum(l) / len(l))))
+        val = round(sum(l) / len(l), 2)
+        values.append(val)
+        sums += values[layer_num]
+        counter += 1
     
     
     plt.style.use('_mpl-gallery')
@@ -107,7 +113,7 @@ def log_sparsity(args, results):
     plt.ylabel('Sparsity rate')
 
     # Add text below the plot, centered
-    plt.figtext(0.5, 0.02, f"wikitext2 score = {results['wikitext2']}, c4 score = {results['c4']}", ha="center", fontsize=12)
+    plt.figtext(0.5, 0.02, f"wikitext2 score = {results['wikitext2']}, c4 score = {results['c4']}, model weight = {100 - sums / counter}", ha="center", fontsize=12)
 
     # Adjust layout to accommodate the text
     #plt.subplots_adjust(bottom=0.2)

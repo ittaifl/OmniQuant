@@ -205,16 +205,10 @@ def omniquant(
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
 
-        # Pruning
-
         if args.prune:
-            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=args.prune, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
+            prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
             if args.prune_method == 'pman':
                 prune_wrapper.init_new_pman_state()
-            else:
-                prune_wrapper.set_variational_train_clip(args.var_train_clip)
-
-        # End pruning
 
         if "mixtral" in args.net.lower():  
             # for mixtral, we only leverage lwc, which can be achieve by simply replace Linear with QuantLinear
@@ -226,6 +220,8 @@ def omniquant(
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
+
+
 
         # Pruning
 
@@ -345,13 +341,8 @@ def omniquant(
                                 prune_wrapper.set_train_prune(train_prune=True)
 
                                 for s in range(args.ngumbel_samples):
-                                    # Disabling pruning
-                                    prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=False, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
-                                    no_prune_quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
-                                    # Enabling pruning
-                                    prune_wrapper.set_new_prune_params(prune_method=args.prune_method, prune_active=args.prune, resume=args.resume, n_gumbel_samples=args.ngumbel_samples, n_epochs=args.epochs, dev=dev)
                                     prune_quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
-                                    prune_loss += loss_func(no_prune_quant_out, prune_quant_out) / args.ngumbel_samples
+                                    prune_loss += loss_func(fp_inps[index:index+args.batch_size,], prune_quant_out) / args.ngumbel_samples
                                     prune_wrapper.get_prune_pman_state().next_sample()
 
                                     if (s + 1) % pman_batch_size == 0:
@@ -467,7 +458,7 @@ def omniquant(
         del layer
         torch.cuda.empty_cache()
 
-    if args.prune_method == 'pman':
+    if args.prune and args.prune_method == 'pman':
         log_grads(args.output_dir, logger)
     del inps
     del quant_inps

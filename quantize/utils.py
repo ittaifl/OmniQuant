@@ -89,6 +89,8 @@ def grad_magnitude(model, i):
         if isinstance(module, QuantLinear):
             for p_name, param in module.named_parameters():
                 if p_name.find('prune') > -1 or p_name.find('sigma') > -1 and param.grad is not None:
+                    #if torch.logical_not(torch.isfinite(param.grad)).any():
+                    #    print(f"problem in layer {i}")
                     if i not in grads.keys():
                         grads[i] = {}
                     if name not in grads[i].keys():
@@ -122,6 +124,21 @@ def log_grads(output_dir, logger):
 
     sparsity_rates = []
     GRAD_THRESHOLD = 1e-2
+    threasholds = [1e-2, 2e-2, 5e-2]
+    spartsity_per_layer = {}
+
+    logger.info(f'Calculating sparsity of gradients per layer')
+    for t in threasholds:
+        spartsity_per_layer[t] = []
+        for layer_num, nest_dict in grads.items():
+            num_of_weights = 0
+            num_of_grads = 0
+            # Creating subplots with multiple histograms
+            for k, d in nest_dict.items():
+                num_of_grads += torch.sum(torch.ge(torch.abs(d), t).to(dtype=torch.int))
+                num_of_weights += torch.numel(d)
+
+            spartsity_per_layer[t].append((1 - (num_of_grads / num_of_weights)) * 100)
 
     for layer_num, nest_dict in grads.items():
         logger.info(f'Creating plots for layer {layer_num}')
@@ -147,6 +164,8 @@ def log_grads(output_dir, logger):
 
         plt.clf()
 
+    
+
     logger.info(f'Total number of linear layers: {len(sparsity_rates)}')
     fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(12, 8))
     axes.hist(sparsity_rates, bins=100, color='Red', edgecolor='black')
@@ -159,6 +178,20 @@ def log_grads(output_dir, logger):
     plt.savefig(os.path.join(output_dir, f"grads_sparsity"))
 
     plt.clf()
+
+    logger.info(f'Total number of linear layers: {len(spartsity_per_layer)}')
+    for t in threasholds:
+        fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(12, 8))
+        axes.plot(spartsity_per_layer[t])
+        axes.set_title(f'Sparsity of gradients in each layer (threashold={t})')
+        axes.set_xlabel('Layer')
+        axes.set_ylabel('Grads sparsity')
+
+        plt.tight_layout()
+
+        plt.savefig(os.path.join(output_dir, f"grads_sparsity_per_layer_threashold_{t}.png"))
+
+        plt.clf()
 
     for layer_num, nest_dict in grad_by_sample.items():
         logger.info(f'Creating plots for layer {layer_num}')
