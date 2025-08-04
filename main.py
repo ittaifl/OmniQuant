@@ -307,6 +307,19 @@ def main():
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
 
+    # ---- Adaptive per-layer scheduling ----
+    parser.add_argument("--auto_layer_epochs", action="store_true",
+        help="Adaptively stop per layer when improvement stalls")
+    parser.add_argument("--layer_min_gain", type=float, default=0.005,
+        help="Min relative loss improvement per epoch to count as progress (e.g., 0.005 = 0.5%)")
+    parser.add_argument("--layer_patience", type=int, default=2,
+        help="Early-stop a layer if <min_gain for this many consecutive epochs")
+    parser.add_argument("--layer_max_epochs", type=int, default=6,
+        help="Upper bound epochs per layer when auto_layer_epochs is on")
+    # (Optional global budget; you can skip this one)
+    parser.add_argument("--budget_epochs", type=int, default=0,
+        help="Total epoch budget across layers (0 = ignore, use layer_max_epochs cap only)")
+
     # Pruning:
 
     parser.add_argument("--prune", default=False, action="store_true", help="activate pruning in parallel to quantization")

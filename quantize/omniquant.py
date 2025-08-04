@@ -300,9 +300,126 @@ def omniquant(
                     prune_wrapper.init_new_pman_state()
                 #if args.prune_method == 'variational':
                 #    prune_optimizer = torch.optim.AdamW([{'params':variational_parameters(qlayer), 'lr':args.var_lr}])
+                        # --- Adaptive per-layer epochs (early stopping) ---
+            use_auto = getattr(args, "auto_layer_epochs", False)
+            target_epochs = args.epochs if not use_auto else min(args.layer_max_epochs, max(1, args.epochs))
+            if use_auto and getattr(args, "budget_epochs", 0) > 0:
+                # Simple per-layer budget share; feel free to keep it equal or extend later
+                # Here we just cap each layer by layer_max_epochs; total budget is enforced externally if you wish.
+                target_epochs = min(target_epochs, args.layer_max_epochs)
+
+            prev_loss_mean = float("inf")
+            no_improve = 0
+            used_epochs = 0
+
+            while used_epochs < target_epochs:
+                loss_list = []
+                norm_list = []
+
+                # --- Pruning (per-epoch hooks) ---
+                if args.prune and args.prune_method == 'pman':
+                    prune_optimizer.zero_grad()
+                    prune_wrapper.get_prune_pman_state().next_epoch()
+
+                pman_batch_size = args.gumbel_batch_size
+                # --- End pruning ---
+
+                # === One epoch over calibration ===
+                for j in range(args.nsamples // args.batch_size):
+                    index = j * args.batch_size
+                    with traincast():
+                        smooth_and_quant_temporary(qlayer, args, is_llama)
+
+                        quant_out = qlayer(
+                            quant_inps[index:index+args.batch_size,],
+                            attention_mask=attention_mask_batch,
+                            position_ids=position_ids
+                        )[0]
+
+                        reg_loss = 0
+                        if args.prune and args.prune_method == 'variational':
+                            reg_loss = eval_variational_reg(qlayer)
+
+                        loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                        if args.aug_loss:
+                            loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+
+                        # --- Pruning inner steps (unchanged) ---
+                        prune_loss = 0
+                        if args.prune and args.prune_method == 'pman':
+                            prune_wrapper.set_train_prune(train_prune=True)
+                            for s in range(args.ngumbel_samples):
+                                prune_quant_out = qlayer(
+                                    quant_inps[index:index+args.batch_size,],
+                                    attention_mask=attention_mask_batch,
+                                    position_ids=position_ids
+                                )[0]
+                                prune_loss += loss_func(fp_inps[index:index+args.batch_size,], prune_quant_out) / args.ngumbel_samples
+                                prune_wrapper.get_prune_pman_state().next_sample()
+
+                                if (s + 1) % pman_batch_size == 0:
+                                    prune_loss.backward(retain_graph=True)
+                                    logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                    prune_optimizer.step()
+                                    prune_optimizer.zero_grad()
+                                    prune_loss = prune_loss.detach()
+                                    prune_loss = 0
+                                    clamp_prune_masks(qlayer)
+
+                            prune_wrapper.set_train_prune(train_prune=False)
+                            prune_wrapper.get_prune_pman_state().next_batch()
+
+                            should_step = args.ngumbel_samples % pman_batch_size != 0
+                            if should_step:
+                                prune_loss.backward(retain_graph=True)
+                                logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
+                                prune_optimizer.step()
+                                prune_optimizer.zero_grad()
+                                clamp_prune_masks(qlayer)
+                        # --- End pruning inner steps ---
+
+                    if not math.isfinite(loss.item()):
+                        logger.info("Loss is NAN, stopping training")
+                        pdb.set_trace()
+
+                    loss_list.append(loss.detach().cpu())
+                    loss = loss + reg_loss  # include regularizer in the optimizer step
+                    optimizer.zero_grad()
+                    param, param_to_name = get_omni_parameters(qlayer, use_shift, args.prune_method == 'variational')
+                    norm = loss_scaler(loss, optimizer, parameters=param).cpu()
+                    norm_list.append(norm.data)
+
+                # === End epoch: logging + early stopping ===
+                loss_mean = torch.stack(loss_list).mean()
+                norm_mean = torch.stack(norm_list).mean()
+                logger.info(f"layer {i} epoch {used_epochs} loss:{loss_mean} norm:{norm_mean} "
+                            f"max memory_allocated {torch.cuda.max_memory_allocated(lm._device)/1024**2} ")
+
+                if use_auto:
+                    # relative improvement vs previous epoch
+                    prev = prev_loss_mean
+                    cur = loss_mean.item()
+                    gain = 1.0 if not math.isfinite(prev) else (prev - cur) / (abs(prev) + 1e-8)
+
+                    # update trackers
+                    if not math.isfinite(prev) or gain >= args.layer_min_gain:
+                        no_improve = 0
+                        prev_loss_mean = cur
+                    else:
+                        no_improve += 1
+
+                    if no_improve >= args.layer_patience:
+                        logger.info(f"[Layer {i}] Early stop at epoch {used_epochs+1}: "
+                                    f"gain<{args.layer_min_gain} for {args.layer_patience} epochs")
+                        break
+                else:
+                    prev_loss_mean = loss_mean.item()
+
+                used_epochs += 1
+            # --- End adaptive loop ---
 
             # End pruning
-            
+ """           
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
@@ -368,6 +485,7 @@ def omniquant(
                                     prune_optimizer.zero_grad()
                                     clamp_prune_masks(qlayer)
                             """
+"""
                             if args.prune_method == 'variational':
                                 prune_loss = eval_variational_reg(qlayer)
                                 prune_loss.backward()
@@ -378,7 +496,7 @@ def omniquant(
                                 #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
                             """
                         # End pruning
-
+"""
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
@@ -395,7 +513,7 @@ def omniquant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
-
+"""
             # Pruning
 
             if args.prune:
