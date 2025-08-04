@@ -51,6 +51,73 @@ def add_new_module(name, original_module, added_module):
         setattr(mod_, levels[-1], added_module)
     else:
         setattr(original_module, name, added_module)     
+import torch
+
+@torch.no_grad()
+def _sqsum(x):  # utility
+    return (x.float() ** 2).sum().item()
+
+def estimate_layer_sensitivity_efisher(model, layer, dataloader, steps=8, device="cuda"):
+    """
+    Empirical Fisher trace proxy: average squared gradient norm of the layer's params
+    over a few small language-modeling mini-batches (teacher forcing).
+    """
+    was_training = model.training
+    model.train()  # enable grads to accumulate EFisher
+    total, n = 0.0, 0
+    params = [p for p in layer.parameters() if p.requires_grad]
+    if not params:
+        return 0.0
+
+    it = iter(dataloader)
+    for _ in range(steps):
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+
+        model.zero_grad(set_to_none=True)
+        # Your dataloader yields tokens at batch[0]; use labels = input_ids for LM loss.
+        input_ids = batch[0].to(device)
+        attention_mask = None
+        # Try to build a dict HF models accept; attention_mask is optional here.
+        inputs = {"input_ids": input_ids, "labels": input_ids}
+        outputs = model(**inputs)   # HF models return .loss when labels present
+        loss = outputs.loss
+        loss.backward()
+
+        s = 0.0
+        for p in params:
+            if p.grad is not None:
+                s += _sqsum(p.grad)
+        total += s
+        n += 1
+
+    model.train(was_training)
+    return total / max(n, 1)
+
+
+def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8):
+    """
+    Turn nonnegative sensitivity scores into integer epoch budgets that sum
+    (approximately) to total_budget, clamped to [min_ep, max_ep].
+    """
+    eps = 1e-12
+    s = [max(float(x), eps) for x in scores]
+    S = sum(s)
+    # Initial proportional allocation
+    alloc = [min(max_ep, max(min_ep, round(total_budget * si / S))) for si in s]
+    # Fix rounding drift if we overshoot
+    diff = sum(alloc) - total_budget
+    if diff > 0:
+        order = sorted(range(len(alloc)), key=lambda i: s[i])  # trim least sensitive first
+        for i in order:
+            if diff == 0:
+                break
+            if alloc[i] > min_ep:
+                alloc[i] -= 1
+                diff -= 1
+    return alloc
 
 def omniquant(
     lm,
@@ -112,6 +179,34 @@ def omniquant(
     else:
         raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
     
+    # ---------- HAWQ-style sensitivity scan & allocation ----------
+    per_layer_alloc = None
+    if getattr(args, "use_hessian_alloc", False):
+        logger.info("Estimating per-layer sensitivity (EFisher proxy) ...")
+        sens_scores = []
+        for li, L in enumerate(layers):  # L are the FP32 layers
+            s = estimate_layer_sensitivity_efisher(
+                model, L, dataloader,
+                steps=getattr(args, "trace_batches", 8),
+                device=dev
+            )
+            sens_scores.append(s)
+            logger.info(f"[sens] layer {li}: {s:.4e}")
+
+        # Decide the total epoch budget
+        if getattr(args, "budget_epochs", 0) > 0:
+            total_budget = args.budget_epochs
+        else:
+            total_budget = len(layers) * max(1, args.epochs)
+
+        per_layer_alloc = allocate_epochs_by_sensitivity(
+            sens_scores,
+            total_budget,
+            min_ep=getattr(args, "min_layer_epochs", 1),
+            max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs))
+        )
+        logger.info(f"[alloc] per-layer epochs (first 12): {per_layer_alloc[:12]}")
+    # --------------------------------------------------------------
     
     layers[0] = layers[0].to(dev)
     if args.deactive_amp and args.epochs>0:
@@ -302,11 +397,18 @@ def omniquant(
                 #    prune_optimizer = torch.optim.AdamW([{'params':variational_parameters(qlayer), 'lr':args.var_lr}])
                         # --- Adaptive per-layer epochs (early stopping) ---
             use_auto = getattr(args, "auto_layer_epochs", False)
-            target_epochs = args.epochs if not use_auto else min(args.layer_max_epochs, max(1, args.epochs))
-            if use_auto and getattr(args, "budget_epochs", 0) > 0:
-                # Simple per-layer budget share; feel free to keep it equal or extend later
-                # Here we just cap each layer by layer_max_epochs; total budget is enforced externally if you wish.
-                target_epochs = min(target_epochs, args.layer_max_epochs)
+
+            # If we computed HAWQ-style allocation, use it as the cap for this layer
+            if 'per_layer_alloc' in locals() and per_layer_alloc is not None:
+                target_epochs = per_layer_alloc[i]
+            else:
+                # fallback: your previous behavior
+                target_epochs = (args.layer_max_epochs if use_auto else args.epochs)
+                if use_auto and getattr(args, "budget_epochs", 0) > 0:
+                    target_epochs = min(target_epochs, args.layer_max_epochs)
+
+            # never below the declared minimum
+            target_epochs = max(target_epochs, getattr(args, "min_layer_epochs", 1))
 
             prev_loss_mean = float("inf")
             no_improve = 0

@@ -306,6 +306,13 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
+    # ---- Sensitivity-based allocation (HAWQ-style) ----
+    parser.add_argument("--use_hessian_alloc", action="store_true",
+        help="Allocate per-layer epoch budgets using an EFisher/Hessian-trace proxy")
+    parser.add_argument("--trace_batches", type=int, default=8,
+        help="Mini-batches to estimate sensitivity (empirical Fisher)")
+    parser.add_argument("--min_layer_epochs", type=int, default=1,
+        help="Minimum epochs any layer gets when using sensitivity allocation")
 
     # ---- Adaptive per-layer scheduling ----
     parser.add_argument("--auto_layer_epochs", action="store_true",
