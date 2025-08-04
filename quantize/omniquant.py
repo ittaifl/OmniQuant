@@ -419,7 +419,7 @@ def omniquant(
             # --- End adaptive loop ---
 
             # End pruning
- """           
+            """           
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
@@ -484,8 +484,7 @@ def omniquant(
                                     prune_optimizer.step()
                                     prune_optimizer.zero_grad()
                                     clamp_prune_masks(qlayer)
-                            """
-"""
+                            
                             if args.prune_method == 'variational':
                                 prune_loss = eval_variational_reg(qlayer)
                                 prune_loss.backward()
@@ -494,9 +493,8 @@ def omniquant(
                                 #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
                                 prune_optimizer.zero_grad()
                                 #logger.info(f'Grad maximum value for layer {i} is: {grad_magnitude(qlayer, i)}')
-                            """
                         # End pruning
-"""
+
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
@@ -513,7 +511,7 @@ def omniquant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
-"""
+            """
             # Pruning
 
             if args.prune:
