@@ -100,10 +100,11 @@ def estimate_layer_sensitivity_efisher(model, layer, dataloader, steps=8, device
 def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8,
                                    mode="pow", gamma=2.0, temperature=0.7):
     """
-    Turn nonnegative sensitivity scores into integer epoch budgets.
+    Convert nonnegative sensitivity scores to integer epoch budgets.
     mode:
-      - "pow":  weights = scores**gamma          (gamma>1 sharpens differences)
-      - "softmax": weights = softmax(log(scores)/temperature)  (temperature<1 sharpens)
+      - "pow":      w_i = s_i ** gamma
+      - "softmax":  w_i = softmax( log(s_i) / temperature )
+    gamma>1 or temperature<1 sharpen differences.
     """
     eps = 1e-12
     s = [max(float(x), eps) for x in scores]
@@ -115,31 +116,30 @@ def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8,
         z = [zi / max(temperature, 1e-6) for zi in z]
         m = max(z)
         e = [math.exp(zi - m) for zi in z]
-        S = sum(e)
-        w = [ei / max(S, eps) for ei in e]
+        S = sum(e) + eps
+        w = [ei / S for ei in e]
     else:
-        w = s
+        w = s  # fallback: proportional
 
     W = sum(w) + eps
     alloc = [min(max_ep, max(min_ep, round(total_budget * wi / W))) for wi in w]
 
-    # Fix rounding drift
+    # Fix rounding drift to match total_budget
     diff = sum(alloc) - total_budget
     if diff > 0:
-        # trim from least-weighted first
+        # trim from least-weighted
         order = sorted(range(len(alloc)), key=lambda i: w[i])
         for i in order:
             if diff == 0: break
             if alloc[i] > min_ep:
                 alloc[i] -= 1; diff -= 1
     elif diff < 0:
-        # add to most-weighted first
+        # add to most-weighted
         order = sorted(range(len(alloc)), key=lambda i: -w[i])
         for i in order:
             if diff == 0: break
             if alloc[i] < max_ep:
                 alloc[i] += 1; diff += 1
-
     return alloc
 
 def omniquant(
@@ -213,6 +213,9 @@ def omniquant(
                 steps=getattr(args, "trace_batches", 8),
                 device=dev
             )
+            if getattr(args, "norm_by_params", False):
+                nparam = sum(p.numel() for p in L.parameters() if p.requires_grad) + 1e-12
+                s = s / nparam  # normalize to reduce bias toward bigger layers
             sens_scores.append(s)
             logger.info(f"[sens] layer {li}: {s:.4e}")
 
@@ -227,8 +230,9 @@ def omniquant(
             total_budget,
             min_ep=getattr(args, "min_layer_epochs", 1),
             max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs)),
-            mode="pow", gamma=2.0,          # try 1.5–3.0
-            # or: mode="softmax", temperature=0.6
+            mode=getattr(args, "alloc_mode", "pow"),
+            gamma=getattr(args, "alloc_gamma", 2.0),
+            temperature=getattr(args, "alloc_temperature", 0.7),
         )
         logger.info(f"[alloc] all per-layer epochs: {per_layer_alloc}")
     # --------------------------------------------------------------
