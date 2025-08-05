@@ -142,6 +142,49 @@ def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8,
                 alloc[i] += 1; diff += 1
     return alloc
 
+# ==== Delta-loss sensitivity helpers =========================================
+@torch.no_grad()
+def _collect_eval_batches(dataloader, steps, device):
+    """Grab a small list of input_ids tensors for scoring; we will also consume
+    these 'steps' from the dataloader (that's OK; nsamples is large)."""
+    batches = []
+    it = iter(dataloader)
+    for _ in range(steps):
+        try:
+            b = next(it)
+        except StopIteration:
+            break
+        batches.append(b[0].to(device))  # your dataloader's first item is input_ids
+    return batches
+
+@torch.no_grad()
+def _avg_lm_loss(model, input_list):
+    """Compute mean LM loss on a small list of input_ids, using teacher forcing."""
+    losses = []
+    for input_ids in input_list:
+        out = model(input_ids=input_ids, labels=input_ids)
+        losses.append(float(out.loss))
+    return sum(losses) / max(len(losses), 1)
+
+def _layer_delta_loss_once(model, layers_ref, layer_idx, DecoderLayer, args, device, is_llama, eval_inputs):
+    """Quantize ONLY layer_idx, measure Δloss = L_q - L_fp on eval_inputs, then restore."""
+    # 1) Build quantized wrapper from the FP layer copy
+    fp_layer = layers_ref[layer_idx]
+    qlayer = DecoderLayer(model.config, fp_layer, args).to(device)
+    # turn on quant for both weights & activations and actually pack scales/zeros
+    set_quant_state(qlayer, weight_quant=True, act_quant=True)
+    qlayer.half()
+    smooth_and_quant_inplace(qlayer, args, is_llama)
+    # 2) Swap into model
+    layers_ref[layer_idx] = qlayer
+    try:
+        L_q = _avg_lm_loss(model, eval_inputs)
+    finally:
+        # 3) Restore original FP layer regardless of errors
+        layers_ref[layer_idx] = fp_layer
+    return L_q
+# ============================================================================
+
 def omniquant(
     lm,
     args,
@@ -202,29 +245,34 @@ def omniquant(
     else:
         raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
     
-    # ---------- HAWQ-style sensitivity scan & allocation ----------
+    # ---------- Layer sensitivity via Δloss (quantize one layer at a time) ---
     per_layer_alloc = None
     if getattr(args, "use_hessian_alloc", False):
-        logger.info("Estimating per-layer sensitivity (EFisher proxy) ...")
+        logger.info("Scoring per-layer sensitivity with Δloss (quantize-only-that-layer)...")
+        # Move the whole model to GPU so we can run LM loss cheaply
+        model.to(dev)
+        # Collect a few small eval batches; this consumes 'trace_batches' from the dataloader.
+        trace_steps = max(2, getattr(args, "trace_batches", 8))
+        eval_inputs = _collect_eval_batches(dataloader, steps=trace_steps, device=dev)
+
+        # Baseline FP loss (shared for all layers) on the same inputs
+        model.eval()
+        with torch.no_grad():
+            L_fp = _avg_lm_loss(model, eval_inputs)
+        logger.info(f"[sens] Baseline FP loss on {len(eval_inputs)} batches: {L_fp:.6f}")
+
         sens_scores = []
-        for li, L in enumerate(layers):  # L are the FP32 layers
-            s = estimate_layer_sensitivity_efisher(
-                model, L, dataloader,
-                steps=getattr(args, "trace_batches", 8),
-                device=dev
-            )
-            if getattr(args, "norm_by_params", False):
-                nparam = sum(p.numel() for p in L.parameters() if p.requires_grad) + 1e-12
-                s = s / nparam  # normalize to reduce bias toward bigger layers
-            sens_scores.append(s)
-            logger.info(f"[sens] layer {li}: {s:.4e}")
+        for li in range(len(layers)):
+            # Quantize only layer li, measure L_q, then Δ = max(L_q - L_fp, 0)
+            L_q = _layer_delta_loss_once(model, layers, li, DecoderLayer, args, dev, is_llama, eval_inputs)
+            delta = max(L_q - L_fp, 0.0)
+            sens_scores.append(delta)
+            logger.info(f"[sens] layer {li}: L_q={L_q:.6f}, Δ={delta:.6f}")
 
         # Decide the total epoch budget
-        if getattr(args, "budget_epochs", 0) > 0:
-            total_budget = args.budget_epochs
-        else:
-            total_budget = len(layers) * max(1, args.epochs)
+        total_budget = getattr(args, "budget_epochs", 0) or (len(layers) * max(1, args.epochs))
 
+        # Use your (knobbed) allocator. Keep your gamma/temperature as args.
         per_layer_alloc = allocate_epochs_by_sensitivity(
             sens_scores,
             total_budget,
@@ -234,8 +282,10 @@ def omniquant(
             gamma=getattr(args, "alloc_gamma", 2.0),
             temperature=getattr(args, "alloc_temperature", 0.7),
         )
+        logger.info(f"[sens] min={min(sens_scores):.6f} max={max(sens_scores):.6f} "
+                    f"ratio={(max(sens_scores)/(min(sens_scores)+1e-12)):.2f}")
         logger.info(f"[alloc] all per-layer epochs: {per_layer_alloc}")
-    # --------------------------------------------------------------
+    # -------------------------------------------------------------------------
     
     layers[0] = layers[0].to(dev)
     if args.deactive_amp and args.epochs>0:
