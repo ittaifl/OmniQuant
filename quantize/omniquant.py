@@ -97,26 +97,49 @@ def estimate_layer_sensitivity_efisher(model, layer, dataloader, steps=8, device
     return total / max(n, 1)
 
 
-def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8):
+def allocate_epochs_by_sensitivity(scores, total_budget, min_ep=1, max_ep=8,
+                                   mode="pow", gamma=2.0, temperature=0.7):
     """
-    Turn nonnegative sensitivity scores into integer epoch budgets that sum
-    (approximately) to total_budget, clamped to [min_ep, max_ep].
+    Turn nonnegative sensitivity scores into integer epoch budgets.
+    mode:
+      - "pow":  weights = scores**gamma          (gamma>1 sharpens differences)
+      - "softmax": weights = softmax(log(scores)/temperature)  (temperature<1 sharpens)
     """
     eps = 1e-12
     s = [max(float(x), eps) for x in scores]
-    S = sum(s)
-    # Initial proportional allocation
-    alloc = [min(max_ep, max(min_ep, round(total_budget * si / S))) for si in s]
-    # Fix rounding drift if we overshoot
+
+    if mode == "pow":
+        w = [si ** gamma for si in s]
+    elif mode == "softmax":
+        z = [math.log(si) for si in s]
+        z = [zi / max(temperature, 1e-6) for zi in z]
+        m = max(z)
+        e = [math.exp(zi - m) for zi in z]
+        S = sum(e)
+        w = [ei / max(S, eps) for ei in e]
+    else:
+        w = s
+
+    W = sum(w) + eps
+    alloc = [min(max_ep, max(min_ep, round(total_budget * wi / W))) for wi in w]
+
+    # Fix rounding drift
     diff = sum(alloc) - total_budget
     if diff > 0:
-        order = sorted(range(len(alloc)), key=lambda i: s[i])  # trim least sensitive first
+        # trim from least-weighted first
+        order = sorted(range(len(alloc)), key=lambda i: w[i])
         for i in order:
-            if diff == 0:
-                break
+            if diff == 0: break
             if alloc[i] > min_ep:
-                alloc[i] -= 1
-                diff -= 1
+                alloc[i] -= 1; diff -= 1
+    elif diff < 0:
+        # add to most-weighted first
+        order = sorted(range(len(alloc)), key=lambda i: -w[i])
+        for i in order:
+            if diff == 0: break
+            if alloc[i] < max_ep:
+                alloc[i] += 1; diff += 1
+
     return alloc
 
 def omniquant(
@@ -203,9 +226,11 @@ def omniquant(
             sens_scores,
             total_budget,
             min_ep=getattr(args, "min_layer_epochs", 1),
-            max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs))
+            max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs)),
+            mode="pow", gamma=2.0,          # try 1.5–3.0
+            # or: mode="softmax", temperature=0.6
         )
-        logger.info(f"[alloc] per-layer epochs (first 12): {per_layer_alloc[:12]}")
+        logger.info(f"[alloc] all per-layer epochs: {per_layer_alloc}")
     # --------------------------------------------------------------
     
     layers[0] = layers[0].to(dev)
