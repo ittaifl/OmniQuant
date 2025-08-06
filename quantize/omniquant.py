@@ -52,12 +52,138 @@ def add_new_module(name, original_module, added_module):
                 mod_ = getattr(mod_, levels[l_idx])
         setattr(mod_, levels[-1], added_module)
     else:
-        setattr(original_module, name, added_module)     
-import torch
+        setattr(original_module, name, added_module)
 
 @torch.no_grad()
 def _sqsum(x):  # utility
     return (x.float() ** 2).sum().item()
+
+def _softmax_logits(logits, temperature=1.0):
+    logits = np.asarray(logits, dtype=np.float64)
+    logits = logits - np.max(logits)
+    z = np.exp(logits / max(temperature, 1e-6))
+    return z / np.sum(z)
+
+def _softmax_log(v, temperature=1.0):
+    v = np.asarray(v, dtype=np.float64)
+    v = v - np.max(v)
+    z = np.exp(v / max(temperature, 1e-6))
+    return z / z.sum()
+
+def _winsorize(x, p_low=5.0, p_high=95.0):
+    lo, hi = np.percentile(x, [p_low, p_high])
+    return np.clip(x, lo, hi)
+
+def alloc_auto(sens, budget_epochs):
+    """
+    Sensitivity-aware, cap-free allocator.
+    No per-layer min/max flags; adapts from budget & sensitivity.
+    Returns a list of integers summing to budget_epochs.
+    """
+    s = np.asarray(sens, dtype=np.float64)
+    L = len(s)
+    B = int(budget_epochs)
+
+    # Robustify sensitivity (avoid single-layer spikes from noise)
+    s_w = _winsorize(s, 5.0, 95.0)
+    s_w = np.maximum(s_w, 1e-12)
+
+    # Spread of sensitivity (scale-free)
+    p10, p90 = np.percentile(s_w, [10.0, 90.0])
+    spread = float(max(p90 / max(p10, 1e-12), 1.0))  # >= 1
+
+    # Budget ratio (>= 1 when B >= L, which is true for your multiples of 24)
+    r = float(B) / float(L) if L > 0 else 1.0
+
+    # === Automatic hyper-shaping (no flags) ===
+    # Base gamma grows with spread (more differentiation if layers truly differ),
+    # but flattens as budget gets large.
+    gamma0 = 1.2 + 0.55 * np.log1p(spread)          # ~[1.2, 2.3] typical
+    gamma  = gamma0 / (1.0 + 0.40 * max(r - 1.0, 0))# flatten with large budgets
+
+    # Temperature increases with budget (smooths large-B allocations)
+    temperature = 1.0 + 0.50 * max(r - 1.0, 0)      # ~1.0 at small B → ~2.0+
+
+    # Diminishing-returns exponent grows with budget (discourage hogging)
+    beta = min(1.6, 1.05 + 0.35 * max(r - 1.0, 0))  # 1.05..1.6
+
+    # Uniform mix increases with budget (softly steers toward uniform when B is big)
+    mix_uniform = min(0.35, 0.10 + 0.20 * max(r - 1.0, 0))
+
+    # === Build robust prior p over layers ===
+    poww = np.power(s_w, gamma)
+    p = _softmax_log(np.log(poww + 1e-12), temperature=temperature)
+    if mix_uniform > 0:
+        p = (1.0 - mix_uniform) * p + (mix_uniform / L)
+
+    # === Continuous water-filling under diminishing returns ===
+    # Solve for lambda in e_i = (p_i / lambda)^(1/beta), s.t. sum e_i = B
+    # Monotone; do a small bisection.
+    def total_epochs(lmbd):
+        return np.power(np.maximum(p / lmbd, 0.0), 1.0 / beta).sum()
+
+    lo, hi = 1e-12, p.max()  # bounds for lambda
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if total_epochs(mid) > B:
+            lo = mid
+        else:
+            hi = mid
+    lmbd = 0.5 * (lo + hi)
+    e_cont = np.power(np.maximum(p / lmbd, 0.0), 1.0 / beta)
+
+    # Normalize just in case of tiny numerical drift
+    e_cont *= (B / max(e_cont.sum(), 1e-12))
+
+    # === Integerization with largest-remainder ===
+    e_floor = np.floor(e_cont).astype(int)
+    rem = B - int(e_floor.sum())
+    if rem > 0:
+        order = np.argsort(-(e_cont - e_floor))  # biggest fractional parts first
+        e_floor[order[:rem]] += 1
+
+    return e_floor.tolist()
+
+def alloc_pow_dr(sens, budget_epochs, min_layer_epochs, gamma, temperature, beta):
+    """
+    Power-weighted diminishing-returns allocator (cap-less).
+    - sens: per-layer sensitivity (higher => more important)
+    - gamma: concentration (like your pow mode)
+    - temperature: softens the initial weights
+    - beta: diminishing-returns exponent (gain ~ w / k^beta for the k-th extra epoch)
+    """
+    L = len(sens)
+    assert budget_epochs >= L * min_layer_epochs, \
+        "budget_epochs must cover the per-layer minimum."
+
+    # Power weighting + temperature smoothing (works like a soft prior)
+    base = np.maximum(np.asarray(sens, dtype=np.float64), 1e-12)
+    poww = np.power(base, gamma)
+    # Use log(poww) as logits, then temperature-softmax to avoid numeric issues
+    prior = _softmax_logits(np.log(poww + 1e-12), temperature=temperature)
+
+    # Start from the floor (prevents starvation)
+    e = np.full(L, int(min_layer_epochs), dtype=np.int64)
+    remaining = int(budget_epochs - np.sum(e))
+
+    # Max-heap over marginal gains; store as (-gain, i, k_next)
+    # where k_next = (e_i - min) + 1 for the *next* unit you would add
+    heap = []
+    for i in range(L):
+        k_next = 1  # first extra epoch above the floor
+        gain = prior[i] / (k_next ** beta)
+        heap.append((-gain, i, k_next))
+    heapq.heapify(heap)
+
+    while remaining > 0:
+        neg_gain, i, k_next = heapq.heappop(heap)
+        e[i] += 1
+        remaining -= 1
+        k_next += 1
+        gain_next = prior[i] / (k_next ** beta)
+        heapq.heappush(heap, (-gain_next, i, k_next))
+
+    return e.tolist()
 
 def estimate_layer_sensitivity_efisher(model, layer, dataloader, steps=8, device="cuda"):
     """
@@ -275,7 +401,14 @@ def omniquant(
         total_budget = getattr(args, "budget_epochs", 0) or (len(layers) * max(1, args.epochs))
 
         # Use the appropriate allocator based on mode
-        if getattr(args, "alloc_mode", "pow") == "powdr":
+        alloc_mode = getattr(args, "alloc_mode", "auto")
+        if alloc_mode == "auto":
+            per_layer_alloc = alloc_auto(sens=sens_scores, budget_epochs=total_budget)
+        elif alloc_mode == "uniform":
+            per_layer_alloc = [total_budget // len(sens_scores)] * len(sens_scores)
+            for i in range(total_budget % len(sens_scores)):
+                per_layer_alloc[i] += 1
+        elif alloc_mode == "powdr":
             per_layer_alloc = alloc_pow_dr(
                 sens=sens_scores,
                 budget_epochs=total_budget,
@@ -291,7 +424,7 @@ def omniquant(
                 total_budget,
                 min_ep=getattr(args, "min_layer_epochs", 1),
                 max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs)),
-                mode=getattr(args, "alloc_mode", "pow"),
+                mode=alloc_mode,
                 gamma=getattr(args, "alloc_gamma", 2.0),
                 temperature=getattr(args, "alloc_temperature", 0.7),
             )
@@ -778,51 +911,4 @@ def omniquant(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
-
-def _softmax_logits(logits, temperature=1.0):
-    logits = np.asarray(logits, dtype=np.float64)
-    logits = logits - np.max(logits)
-    z = np.exp(logits / max(temperature, 1e-6))
-    return z / np.sum(z)
-
-def alloc_pow_dr(sens, budget_epochs, min_layer_epochs, gamma, temperature, beta):
-    """
-    Power-weighted diminishing-returns allocator (cap-less).
-    - sens: per-layer sensitivity (higher => more important)
-    - gamma: concentration (like your pow mode)
-    - temperature: softens the initial weights
-    - beta: diminishing-returns exponent (gain ~ w / k^beta for the k-th extra epoch)
-    """
-    L = len(sens)
-    assert budget_epochs >= L * min_layer_epochs, \
-        "budget_epochs must cover the per-layer minimum."
-
-    # Power weighting + temperature smoothing (works like a soft prior)
-    base = np.maximum(np.asarray(sens, dtype=np.float64), 1e-12)
-    poww = np.power(base, gamma)
-    # Use log(poww) as logits, then temperature-softmax to avoid numeric issues
-    prior = _softmax_logits(np.log(poww + 1e-12), temperature=temperature)
-
-    # Start from the floor (prevents starvation)
-    e = np.full(L, int(min_layer_epochs), dtype=np.int64)
-    remaining = int(budget_epochs - np.sum(e))
-
-    # Max-heap over marginal gains; store as (-gain, i, k_next)
-    # where k_next = (e_i - min) + 1 for the *next* unit you would add
-    heap = []
-    for i in range(L):
-        k_next = 1  # first extra epoch above the floor
-        gain = prior[i] / (k_next ** beta)
-        heap.append((-gain, i, k_next))
-    heapq.heapify(heap)
-
-    while remaining > 0:
-        neg_gain, i, k_next = heapq.heappop(heap)
-        e[i] += 1
-        remaining -= 1
-        k_next += 1
-        gain_next = prior[i] / (k_next ** beta)
-        heapq.heappush(heap, (-gain_next, i, k_next))
-
-    return e.tolist()
 

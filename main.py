@@ -315,9 +315,9 @@ def main():
         help="Minimum epochs any layer gets when using sensitivity allocation")
 
     # ---- Allocation sharpness knob ----
-    parser.add_argument("--alloc_mode", type=str, default="pow",
-        choices=["pow", "softmax", "powdr"],
-        help="How to turn sensitivities into weights: 'pow' uses s**gamma, 'softmax' uses softmax(log s / T), 'powdr' uses diminishing returns")
+    parser.add_argument("--alloc_mode", type=str, default="auto",
+        choices=["auto", "uniform", "pow", "softmax", "powdr"],
+        help="Allocation mode: auto | uniform | pow | softmax | powdr")
     parser.add_argument("--alloc_gamma", type=float, default=1.0,
         help="Sharpness knob for 'pow' mode. 1.0=proportional, 1.5–3.0=sharper, >3 very sharp")
     parser.add_argument("--alloc_temperature", type=float, default=0.7,
