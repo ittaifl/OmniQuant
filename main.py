@@ -313,7 +313,6 @@ def main():
         help="Mini-batches to estimate sensitivity (empirical Fisher)")
     parser.add_argument("--min_layer_epochs", type=int, default=1,
         help="Minimum epochs any layer gets when using sensitivity allocation")
-
     # ---- Allocation sharpness knob ----
     parser.add_argument("--alloc_mode", type=str, default="auto",
         choices=["auto", "uniform", "pow", "softmax", "powdr"],

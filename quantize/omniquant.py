@@ -25,6 +25,7 @@ try:
 except:
     print("auto_gptq is required for real quantization")
 
+
 def get_memory_usage(logger):
     memory_info = nvidia_smi_memory_info()[0]
     t = memory_info['total_memory']
