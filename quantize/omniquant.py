@@ -11,6 +11,8 @@ import utils
 import os
 import pdb
 import gc
+import numpy as np
+import heapq
 from parallel_utils import nvidia_smi_memory_info
 from quantize.utils import let_parameters, lwc_parameters, get_omni_parameters,\
                             omni_state_dict, register_scales_and_zeros,smooth_and_quant_temporary,\
@@ -272,16 +274,27 @@ def omniquant(
         # Decide the total epoch budget
         total_budget = getattr(args, "budget_epochs", 0) or (len(layers) * max(1, args.epochs))
 
-        # Use your (knobbed) allocator. Keep your gamma/temperature as args.
-        per_layer_alloc = allocate_epochs_by_sensitivity(
-            sens_scores,
-            total_budget,
-            min_ep=getattr(args, "min_layer_epochs", 1),
-            max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs)),
-            mode=getattr(args, "alloc_mode", "pow"),
-            gamma=getattr(args, "alloc_gamma", 2.0),
-            temperature=getattr(args, "alloc_temperature", 0.7),
-        )
+        # Use the appropriate allocator based on mode
+        if getattr(args, "alloc_mode", "pow") == "powdr":
+            per_layer_alloc = alloc_pow_dr(
+                sens=sens_scores,
+                budget_epochs=total_budget,
+                min_layer_epochs=getattr(args, "min_layer_epochs", 1),
+                gamma=getattr(args, "alloc_gamma", 2.0),
+                temperature=getattr(args, "alloc_temperature", 0.7),
+                beta=getattr(args, "alloc_beta", 0.95)
+            )
+        else:
+            # Use your existing allocator for pow/softmax modes
+            per_layer_alloc = allocate_epochs_by_sensitivity(
+                sens_scores,
+                total_budget,
+                min_ep=getattr(args, "min_layer_epochs", 1),
+                max_ep=getattr(args, "layer_max_epochs", max(1, args.epochs)),
+                mode=getattr(args, "alloc_mode", "pow"),
+                gamma=getattr(args, "alloc_gamma", 2.0),
+                temperature=getattr(args, "alloc_temperature", 0.7),
+            )
         logger.info(f"[sens] min={min(sens_scores):.6f} max={max(sens_scores):.6f} "
                     f"ratio={(max(sens_scores)/(min(sens_scores)+1e-12)):.2f}")
         logger.info(f"[alloc] all per-layer epochs: {per_layer_alloc}")
@@ -765,4 +778,51 @@ def omniquant(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
+
+def _softmax_logits(logits, temperature=1.0):
+    logits = np.asarray(logits, dtype=np.float64)
+    logits = logits - np.max(logits)
+    z = np.exp(logits / max(temperature, 1e-6))
+    return z / np.sum(z)
+
+def alloc_pow_dr(sens, budget_epochs, min_layer_epochs, gamma, temperature, beta):
+    """
+    Power-weighted diminishing-returns allocator (cap-less).
+    - sens: per-layer sensitivity (higher => more important)
+    - gamma: concentration (like your pow mode)
+    - temperature: softens the initial weights
+    - beta: diminishing-returns exponent (gain ~ w / k^beta for the k-th extra epoch)
+    """
+    L = len(sens)
+    assert budget_epochs >= L * min_layer_epochs, \
+        "budget_epochs must cover the per-layer minimum."
+
+    # Power weighting + temperature smoothing (works like a soft prior)
+    base = np.maximum(np.asarray(sens, dtype=np.float64), 1e-12)
+    poww = np.power(base, gamma)
+    # Use log(poww) as logits, then temperature-softmax to avoid numeric issues
+    prior = _softmax_logits(np.log(poww + 1e-12), temperature=temperature)
+
+    # Start from the floor (prevents starvation)
+    e = np.full(L, int(min_layer_epochs), dtype=np.int64)
+    remaining = int(budget_epochs - np.sum(e))
+
+    # Max-heap over marginal gains; store as (-gain, i, k_next)
+    # where k_next = (e_i - min) + 1 for the *next* unit you would add
+    heap = []
+    for i in range(L):
+        k_next = 1  # first extra epoch above the floor
+        gain = prior[i] / (k_next ** beta)
+        heap.append((-gain, i, k_next))
+    heapq.heapify(heap)
+
+    while remaining > 0:
+        neg_gain, i, k_next = heapq.heappop(heap)
+        e[i] += 1
+        remaining -= 1
+        k_next += 1
+        gain_next = prior[i] / (k_next ** beta)
+        heapq.heappush(heap, (-gain_next, i, k_next))
+
+    return e.tolist()
 

@@ -316,12 +316,14 @@ def main():
 
     # ---- Allocation sharpness knob ----
     parser.add_argument("--alloc_mode", type=str, default="pow",
-        choices=["pow", "softmax"],
-        help="How to turn sensitivities into weights: 'pow' uses s**gamma, 'softmax' uses softmax(log s / T)")
+        choices=["pow", "softmax", "powdr"],
+        help="How to turn sensitivities into weights: 'pow' uses s**gamma, 'softmax' uses softmax(log s / T), 'powdr' uses diminishing returns")
     parser.add_argument("--alloc_gamma", type=float, default=1.0,
         help="Sharpness knob for 'pow' mode. 1.0=proportional, 1.5–3.0=sharper, >3 very sharp")
     parser.add_argument("--alloc_temperature", type=float, default=0.7,
         help="Sharpness knob for 'softmax' mode. Lower T→sharper (0.3 very sharp, 1.0 neutral)")
+    parser.add_argument("--alloc_beta", type=float, default=0.95,
+        help="Diminishing-returns exponent for powdr (higher => softer cap, 1.0 ≈ 1/k).")
     parser.add_argument("--norm_by_params", action="store_true",
         help="Normalize sensitivity by the layer parameter count (recommended)")
 
