@@ -69,61 +69,69 @@ def _softmax_log(v, temperature=1.0):
     v = np.asarray(v, dtype=np.float64)
     v = v - np.max(v)
     z = np.exp(v / max(temperature, 1e-6))
-    return z / z.sum()
+    return z / max(z.sum(), 1e-12)
 
 def _winsorize(x, p_low=5.0, p_high=95.0):
     lo, hi = np.percentile(x, [p_low, p_high])
     return np.clip(x, lo, hi)
 
-def alloc_auto(sens, budget_epochs):
+def alloc_auto(sens, budget_epochs, debug_log_fn=None):
     """
-    Sensitivity-aware, cap-free allocator.
-    No per-layer min/max flags; adapts from budget & sensitivity.
-    Returns a list of integers summing to budget_epochs.
+    Cap-free, flag-free, sensitivity-aware epoch allocator.
+    Adapts to budget and measured sensitivity spread.
+    Returns integer epochs summing exactly to budget_epochs.
     """
     s = np.asarray(sens, dtype=np.float64)
     L = len(s)
     B = int(budget_epochs)
 
-    # Robustify sensitivity (avoid single-layer spikes from noise)
+    if L == 0 or B <= 0:
+        return [0] * L
+
+    # Robustify sensitivity to outliers
     s_w = _winsorize(s, 5.0, 95.0)
     s_w = np.maximum(s_w, 1e-12)
 
-    # Spread of sensitivity (scale-free)
+    # Spread metrics
     p10, p90 = np.percentile(s_w, [10.0, 90.0])
-    spread = float(max(p90 / max(p10, 1e-12), 1.0))  # >= 1
+    spread_ratio = float(max(p90 / max(p10, 1e-12), 1.0))  # >=1
+    spread_log = float(np.log1p(spread_ratio))             # smooth, ~0 when flat
 
-    # Budget ratio (>= 1 when B >= L, which is true for your multiples of 24)
-    r = float(B) / float(L) if L > 0 else 1.0
+    # Budget-per-layer ratio
+    r = float(B) / float(L)
 
-    # === Automatic hyper-shaping (no flags) ===
-    # Base gamma grows with spread (more differentiation if layers truly differ),
-    # but flattens as budget gets large.
-    gamma0 = 1.2 + 0.55 * np.log1p(spread)          # ~[1.2, 2.3] typical
-    gamma  = gamma0 / (1.0 + 0.40 * max(r - 1.0, 0))# flatten with large budgets
+    # ==== Auto shaping (v2): preserve differentiation when spread is real ====
 
-    # Temperature increases with budget (smooths large-B allocations)
-    temperature = 1.0 + 0.50 * max(r - 1.0, 0)      # ~1.0 at small B → ~2.0+
+    # Base gamma grows with spread; never below 1.0 (no compression of contrast)
+    gamma0 = 1.0 + 0.80 * spread_log           # ~[1.0, 3.5] typical
 
-    # Diminishing-returns exponent grows with budget (discourage hogging)
-    beta = min(1.6, 1.05 + 0.35 * max(r - 1.0, 0))  # 1.05..1.6
+    # Flattening factor decreases with spread; increases with r
+    # so big budgets flatten *only if* spread is genuinely small.
+    flatten = (0.25 * max(r - 1.0, 0.0)) / (1.0 + 1.5 * spread_log)
+    gamma = max(1.0, gamma0 / (1.0 + flatten))
 
-    # Uniform mix increases with budget (softly steers toward uniform when B is big)
-    mix_uniform = min(0.35, 0.10 + 0.20 * max(r - 1.0, 0))
+    # Temperature: mild smoothing; damped when spread is large
+    temperature = 1.0 + (0.35 * max(r - 1.0, 0.0)) / (1.0 + 2.0 * spread_log)
+    temperature = min(3.0, max(1.0, temperature))
 
-    # === Build robust prior p over layers ===
+    # Diminishing-returns exponent (concavity). Small growth with r only.
+    beta = min(1.6, 1.10 + 0.30 * max(r - 1.0, 0.0) / (1.0 + 2.0 * spread_log))
+
+    # Soft uniform mix acts as a safety floor, but stays small when spread is large
+    mix_uniform = (0.15 * max(r - 1.0, 0.0)) / (1.0 + 2.5 * spread_log) + 0.03
+    mix_uniform = float(min(0.25, max(0.02, mix_uniform)))  # ∈ [2%, 25%]
+
+    # ==== Build robust prior over layers ====
     poww = np.power(s_w, gamma)
     p = _softmax_log(np.log(poww + 1e-12), temperature=temperature)
     if mix_uniform > 0:
         p = (1.0 - mix_uniform) * p + (mix_uniform / L)
 
-    # === Continuous water-filling under diminishing returns ===
-    # Solve for lambda in e_i = (p_i / lambda)^(1/beta), s.t. sum e_i = B
-    # Monotone; do a small bisection.
+    # ==== Water-filling under diminishing returns ====
     def total_epochs(lmbd):
         return np.power(np.maximum(p / lmbd, 0.0), 1.0 / beta).sum()
 
-    lo, hi = 1e-12, p.max()  # bounds for lambda
+    lo, hi = 1e-12, p.max()
     for _ in range(60):
         mid = 0.5 * (lo + hi)
         if total_epochs(mid) > B:
@@ -131,17 +139,24 @@ def alloc_auto(sens, budget_epochs):
         else:
             hi = mid
     lmbd = 0.5 * (lo + hi)
+
     e_cont = np.power(np.maximum(p / lmbd, 0.0), 1.0 / beta)
+    e_cont *= (B / max(e_cont.sum(), 1e-12))  # exact normalization
 
-    # Normalize just in case of tiny numerical drift
-    e_cont *= (B / max(e_cont.sum(), 1e-12))
-
-    # === Integerization with largest-remainder ===
+    # ==== Largest remainder to integers ====
     e_floor = np.floor(e_cont).astype(int)
     rem = B - int(e_floor.sum())
     if rem > 0:
-        order = np.argsort(-(e_cont - e_floor))  # biggest fractional parts first
+        order = np.argsort(-(e_cont - e_floor))
         e_floor[order[:rem]] += 1
+
+    # Optional debug line
+    if debug_log_fn is not None:
+        debug_log_fn(
+            f"[auto] r={r:.2f}, spread_ratio={spread_ratio:.2f}, "
+            f"gamma={gamma:.3f}, temp={temperature:.3f}, beta={beta:.3f}, "
+            f"mixU={mix_uniform:.3f}"
+        )
 
     return e_floor.tolist()
 
@@ -404,7 +419,8 @@ def omniquant(
         # Use the appropriate allocator based on mode
         alloc_mode = getattr(args, "alloc_mode", "auto")
         if alloc_mode == "auto":
-            per_layer_alloc = alloc_auto(sens=sens_scores, budget_epochs=total_budget)
+            def _dbg(msg): logger.info(msg)
+            per_layer_alloc = alloc_auto(sens=sens_scores, budget_epochs=total_budget, debug_log_fn=_dbg)
         elif alloc_mode == "uniform":
             per_layer_alloc = [total_budget // len(sens_scores)] * len(sens_scores)
             for i in range(total_budget % len(sens_scores)):
